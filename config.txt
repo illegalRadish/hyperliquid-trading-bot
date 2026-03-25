@@ -1,0 +1,19 @@
+{
+    "secret_key": "1a03943585a45ab7e2ce1b032cdee2384bc1cbaa1435e7fa8fd37dec5bc81480",
+    "account_address": "0xB88CcE8c7B8f7a8cEAAAfa33Edd9D6B1CaE25eae",
+    "use_testnet": true,
+
+    "strategy": {
+        "coin": "BTC",
+        "timeframe": "30m",
+        "lookback_periods": 24,
+        "volume_multiplier": 2.0,
+        "position_size_pct": 0.1,
+        "atr_period": 14,
+        "atr_stop_multiplier": 2.5,
+        "tp_range_multiplier": 2,
+        "min_range_atr_ratio": 2.0,
+        "trailing_stop": true,
+        "slippage": 0.05
+    }
+}

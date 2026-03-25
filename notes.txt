@@ -1,0 +1,17 @@
+Concrete changes to increase win rate
+Here are the filters I'd add, ranked by likely impact:
+
+1. Add a trend filter (biggest impact)
+Only take longs above a moving average, shorts below it. This alone would have eliminated most of the 8 losing longs. A simple 50-period EMA or even the 20-period SMA you're already computing would work.
+
+2. Require candle close confirmation
+Right now, the strategy can enter on a candle that wicks past the level. Requiring the close to hold above/below the breakout level for the full candle — or even waiting for a second candle to confirm — filters out the false breakouts that are getting stopped in 30-45 minutes.
+
+3. Tighten the volume multiplier
+Raise volume_multiplier from 1.5 to 2.0-2.5. The strongest breakouts come with volume well above average. This means fewer trades, but fewer false signals.
+
+4. Use a wider timeframe
+15m candles generate a lot of noise. Switching to 1h reduced your total trades from 115 to something more manageable in your 60-day run, and the profit factor was higher. More confirmation per signal.
+
+5. Add an ATR contraction filter
+The best breakouts come after a period of compression. If you check that the current ATR is below its own moving average (volatility squeeze), you're entering when the range is tight and the breakout is more likely to be real.

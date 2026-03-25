@@ -1,0 +1,19 @@
+{
+    "secret_key": "0xYOUR_PRIVATE_KEY_HERE",
+    "account_address": "0xYOUR_ADDRESS_HERE",
+    "use_testnet": false,
+
+    "strategy": {
+        "coin": "ETH",
+        "timeframe": "15m",
+        "lookback_periods": 20,
+        "volume_multiplier": 1.5,
+        "position_size_pct": 0.05,
+        "atr_period": 14,
+        "atr_stop_multiplier": 2.0,
+        "tp_range_multiplier": 1.5,
+        "min_range_atr_ratio": 2.0,
+        "trailing_stop": true,
+        "slippage": 0.05
+    }
+}
