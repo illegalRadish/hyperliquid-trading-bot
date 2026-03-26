@@ -22,7 +22,7 @@ from typing import Optional
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
-from Breakout import Candle, StrategyConfig, compute_atr, parse_candles, TIMEFRAME_SECONDS
+from Breakout import Candle, StrategyConfig, compute_atr, parse_candles, spot_meta_for_perp_bot, TIMEFRAME_SECONDS
 
 log = logging.getLogger("backtest")
 
@@ -63,7 +63,7 @@ class SimPosition:
 
 def fetch_candles_historical(coin: str, timeframe: str, days: int, use_testnet: bool = False) -> list[Candle]:
     api_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
-    info = Info(api_url, skip_ws=True)
+    info = Info(api_url, skip_ws=True, spot_meta=spot_meta_for_perp_bot(api_url))
     interval_s = TIMEFRAME_SECONDS[timeframe]
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 86400 * 1000

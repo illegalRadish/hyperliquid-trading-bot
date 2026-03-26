@@ -11,7 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import eth_account
 from hyperliquid.exchange import Exchange
@@ -118,6 +118,14 @@ def load_credentials(path: str = "config.json") -> tuple[str, str, bool]:
     return data["secret_key"], data.get("account_address", ""), data.get("use_testnet", False)
 
 
+def spot_meta_for_perp_bot(api_url: str) -> Optional[dict[str, Any]]:
+    """Testnet spot_meta can reference token indices outside tokens[]; SDK Info() crashes with IndexError.
+    Perp-only bots do not need spot asset indexing — pass an empty universe so Info/Exchange can init."""
+    if api_url.rstrip("/") == constants.TESTNET_API_URL.rstrip("/"):
+        return {"universe": [], "tokens": []}
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Core strategy
 # ---------------------------------------------------------------------------
@@ -145,9 +153,65 @@ class MomentumBreakout:
 
     # ---- account ----
 
+    def _spot_usdc_balance(self) -> float:
+        try:
+            spot = self.info.spot_user_state(self.address)
+        except Exception as e:
+            self.log.warning("Could not fetch spot balances (spotClearinghouseState): %s", e)
+            return 0.0
+        for b in spot.get("balances") or []:
+            coin = str(b.get("coin", "")).upper()
+            if coin == "USDC":
+                return float(b.get("total", 0) or 0)
+        return 0.0
+
     def get_account_value(self) -> float:
+        """Capital used for sizing in unified-safe order:
+        1) marginSummary.accountValue (perp clearinghouse)
+        2) withdrawable
+        3) spot USDC balance
+        """
         state = self.info.user_state(self.address)
-        return float(state["marginSummary"]["accountValue"])
+        ms = state.get("marginSummary") or {}
+        perp_account_value = float(ms.get("accountValue", 0) or 0)
+        if perp_account_value > 1e-6:
+            return perp_account_value
+        withdrawable = float(state.get("withdrawable", 0) or 0)
+        if withdrawable > 1e-6:
+            return withdrawable
+        spot_usdc = self._spot_usdc_balance()
+        if spot_usdc > 1e-6:
+            return spot_usdc
+        return 0.0
+
+    def log_capital_summary(self) -> None:
+        """Log perp margin vs spot balances. Perp `accountValue` is often $0 until USDC is moved from spot → perp."""
+        ch = self.info.user_state(self.address)
+        ms = ch.get("marginSummary") or {}
+        cms = ch.get("crossMarginSummary") or {}
+        perp = float(ms.get("accountValue", 0) or 0)
+        total_raw = float(ms.get("totalRawUsd", 0) or 0)
+        withdrawable = float(ch.get("withdrawable", 0) or 0)
+        sizing_capital = self.get_account_value()
+        source = "marginSummary.accountValue"
+        if perp <= 1e-6 and withdrawable > 1e-6:
+            source = "withdrawable"
+        elif perp <= 1e-6 and withdrawable <= 1e-6:
+            source = "spot USDC fallback"
+        self.log.info(
+            "Perp margin — accountValue=$%.2f, totalRawUsd=$%.2f, withdrawable=$%.2f",
+            perp, total_raw, withdrawable,
+        )
+        self.log.info("Sizing capital = $%.2f (source: %s)", sizing_capital, source)
+        if cms:
+            self.log.debug("crossMarginSummary accountValue=%s", cms.get("accountValue"))
+
+        spot_usdc = self._spot_usdc_balance()
+        if spot_usdc > 1e-12:
+            self.log.info("Spot — USDC: total=%.4f", spot_usdc)
+
+        if perp < 1e-6 and spot_usdc > 1e-6:
+            self.log.warning("Perp accountValue is $0; using spot USDC fallback ($%.2f) for sizing.", spot_usdc)
 
     def sync_position_from_exchange(self) -> None:
         """Reconcile local state with what's actually on the exchange."""
@@ -425,11 +489,16 @@ def main():
     logging.getLogger("breakout").info(f"Starting bot on {network_name}")
 
     wallet = eth_account.Account.from_key(secret_key)
-    info = Info(api_url, skip_ws=True)
-    exchange = Exchange(wallet, api_url, account_address=account_address or None)
+    sm = spot_meta_for_perp_bot(api_url)
+    info = Info(api_url, skip_ws=True, spot_meta=sm)
+    exchange = Exchange(wallet, api_url, account_address=account_address or None, spot_meta=sm)
     address = account_address or wallet.address
 
     bot = MomentumBreakout(cfg, info, exchange, address)
+    try:
+        bot.log_capital_summary()
+    except Exception:
+        logging.getLogger("breakout").exception("Failed to fetch capital summary on startup")
     bot.run()
 
 
