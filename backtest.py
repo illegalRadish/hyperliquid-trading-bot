@@ -138,34 +138,80 @@ class BacktestEngine:
 
     # ---- signal (mirrors live bot logic) ----
 
-    def _evaluate(self, window: list[Candle]) -> Optional[str]:
-        if len(window) < self.cfg.lookback_periods + 2:
+    def _evaluate(self, window: list[Candle], all_candles: list[Candle] = None, candle_idx: int = -1) -> Optional[str]:
+        n_confirm = self.cfg.confirm_candles
+        if len(window) < self.cfg.lookback_periods + 1 + n_confirm:
             return None
 
-        lookback = window[-(self.cfg.lookback_periods + 1):-1]
-        current = window[-1]
+        # --- session filter ---
+        if self.cfg.blocked_utc_hours:
+            import datetime
+            last_ts = window[-1].timestamp / 1000
+            utc_hour = datetime.datetime.utcfromtimestamp(last_ts).hour
+            if utc_hour in self.cfg.blocked_utc_hours:
+                return None
 
+        lookback = window[-(self.cfg.lookback_periods + n_confirm):-n_confirm]
         highest_high = max(c.high for c in lookback)
         lowest_low = min(c.low for c in lookback)
         range_size = highest_high - lowest_low
 
         avg_volume = sum(c.volume for c in lookback) / len(lookback)
-        atr = compute_atr(window[:-1], self.cfg.atr_period)
+        atr = compute_atr(window[:-n_confirm], self.cfg.atr_period)
 
         if atr == 0 or range_size < atr * self.cfg.min_range_atr_ratio:
             return None
 
-        volume_confirmed = current.volume > avg_volume * self.cfg.volume_multiplier
+        # --- ATR regime filter ---
+        if self.cfg.max_atr_percentile < 100.0 and all_candles is not None and candle_idx >= 0:
+            window_len = min(self.cfg.atr_lookback_window, candle_idx)
+            if window_len > self.cfg.atr_period:
+                historical_atrs = []
+                for j in range(self.cfg.atr_period + 1, window_len + 1):
+                    slice_end = candle_idx - n_confirm - (window_len - j)
+                    slice_start = max(0, slice_end - self.cfg.atr_period - 1)
+                    if slice_end > slice_start:
+                        a = compute_atr(all_candles[slice_start:slice_end], self.cfg.atr_period)
+                        if a > 0:
+                            historical_atrs.append(a)
+                if historical_atrs:
+                    historical_atrs.sort()
+                    idx = int(len(historical_atrs) * self.cfg.max_atr_percentile / 100)
+                    idx = min(idx, len(historical_atrs) - 1)
+                    if atr > historical_atrs[idx]:
+                        return None
 
-        if current.close > highest_high and volume_confirmed:
-            return "LONG"
-        if current.close < lowest_low and volume_confirmed:
-            return "SHORT"
-        return None
+        confirm_slice = window[-n_confirm:]
+        total_confirm_volume = sum(c.volume for c in confirm_slice)
+        avg_confirm_volume = total_confirm_volume / n_confirm
+
+        volume_confirmed = avg_confirm_volume > avg_volume * self.cfg.volume_multiplier
+
+        signal = None
+        if all(c.close > highest_high for c in confirm_slice) and volume_confirmed:
+            signal = "LONG"
+        elif all(c.close < lowest_low for c in confirm_slice) and volume_confirmed:
+            signal = "SHORT"
+
+        if signal is None:
+            return None
+
+        # --- trend filter (MA) ---
+        if self.cfg.ma_period > 0 and len(window) >= self.cfg.ma_period:
+            ma = sum(c.close for c in window[-self.cfg.ma_period:]) / self.cfg.ma_period
+            if signal == "LONG" and window[-1].close < ma:
+                return None
+            if signal == "SHORT" and window[-1].close > ma:
+                return None
+
+        return signal
 
     # ---- position management ----
 
     def _open(self, signal: str, window: list[Candle]) -> None:
+        if self.equity <= 0:
+            return
+
         current = window[-1]
         atr = compute_atr(window[:-1], self.cfg.atr_period)
         lookback = window[-(self.cfg.lookback_periods + 1):-1]
@@ -190,22 +236,26 @@ class BacktestEngine:
             entry_price=entry, size=sz, stop_loss=sl, take_profit=tp,
         )
 
-    def _check_exit(self, candle: Candle) -> Optional[str]:
-        """Check if the candle triggers SL or TP. Returns exit reason or None."""
+    def _check_exit(self, candle: Candle) -> Optional[tuple[str, float]]:
+        """Check if the candle triggers SL or TP. Returns (reason, fill_price) or None."""
         pos = self.position
         if pos is None:
             return None
 
         if pos.side == "LONG":
             if candle.low <= pos.stop_loss:
-                return "sl"
+                fill = min(pos.stop_loss, candle.open)
+                return "sl", fill
             if candle.high >= pos.take_profit:
-                return "tp"
+                fill = max(pos.take_profit, candle.open)
+                return "tp", fill
         else:
             if candle.high >= pos.stop_loss:
-                return "sl"
+                fill = max(pos.stop_loss, candle.open)
+                return "sl", fill
             if candle.low <= pos.take_profit:
-                return "tp"
+                fill = min(pos.take_profit, candle.open)
+                return "tp", fill
         return None
 
     def _close(self, exit_price: float, exit_time: int, reason: str) -> None:
@@ -246,21 +296,22 @@ class BacktestEngine:
     # ---- run ----
 
     def run(self) -> "BacktestResult":
-        warmup = max(self.cfg.lookback_periods, self.cfg.atr_period) + 5
+        base_warmup = max(self.cfg.lookback_periods, self.cfg.atr_period) + 5
+        warmup = max(base_warmup, self.cfg.ma_period, self.cfg.atr_lookback_window)
 
         for i in range(warmup, len(self.candles)):
             candle = self.candles[i]
-            window = self.candles[max(0, i - warmup - self.cfg.lookback_periods):i + 1]
+            window = self.candles[max(0, i - warmup):i + 1]
 
             if self.position is not None:
-                reason = self._check_exit(candle)
-                if reason:
-                    exit_px = self.position.stop_loss if reason == "sl" else self.position.take_profit
+                exit_result = self._check_exit(candle)
+                if exit_result:
+                    reason, exit_px = exit_result
                     self._close(exit_px, candle.timestamp, reason)
                 else:
                     self._trailing_stop(window)
             else:
-                signal = self._evaluate(window)
+                signal = self._evaluate(window, all_candles=self.candles, candle_idx=i)
                 if signal:
                     self._open(signal, window)
 
@@ -379,8 +430,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     parser = argparse.ArgumentParser(description="Backtest Momentum Breakout with Volume")
-    parser.add_argument("--coin", default="ETH")
-    parser.add_argument("--tf", default="15m", help="Candle timeframe")
+    parser.add_argument("--coin", default=None, help="Cryptocurrency (overrides config)")
+    parser.add_argument("--tf", default=None, help="Candle timeframe (overrides config)")
     parser.add_argument("--days", type=int, default=30, help="Days of history to fetch")
     parser.add_argument("--capital", type=float, default=10_000.0, help="Starting capital ($)")
     parser.add_argument("--csv", default="", help="Load candles from CSV instead of fetching")
@@ -392,17 +443,24 @@ def main():
     args = parser.parse_args()
 
     cfg = StrategyConfig.from_file(args.config)
-    cfg.coin = args.coin
-    cfg.timeframe = args.tf
+    if args.coin:
+        cfg.coin = args.coin
+    if args.tf:
+        cfg.timeframe = args.tf
 
     network_name = "testnet" if args.testnet else "mainnet"
-    
+
+    log.info("Config: coin=%s tf=%s lookback=%d vol_mult=%.1f confirm=%d pos_size=%.2f atr_stop=%.1f tp_mult=%.1f range_atr=%.1f trail=%s",
+             cfg.coin, cfg.timeframe, cfg.lookback_periods, cfg.volume_multiplier,
+             cfg.confirm_candles, cfg.position_size_pct, cfg.atr_stop_multiplier,
+             cfg.tp_range_multiplier, cfg.min_range_atr_ratio, cfg.trailing_stop)
+
     if args.csv:
         log.info("Loading candles from %s", args.csv)
         candles = load_candles_csv(args.csv)
     else:
-        log.info("Fetching %d days of %s %s candles from Hyperliquid %s", args.days, args.coin, args.tf, network_name)
-        candles = fetch_candles_historical(args.coin, args.tf, args.days, use_testnet=args.testnet)
+        log.info("Fetching %d days of %s %s candles from Hyperliquid %s", args.days, cfg.coin, cfg.timeframe, network_name)
+        candles = fetch_candles_historical(cfg.coin, cfg.timeframe, args.days, use_testnet=args.testnet)
         if args.save_csv:
             save_candles_csv(candles, args.save_csv)
 

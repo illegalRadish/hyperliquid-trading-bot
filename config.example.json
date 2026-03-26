@@ -13,7 +13,12 @@
         "atr_stop_multiplier": 2.0,
         "tp_range_multiplier": 1.5,
         "min_range_atr_ratio": 2.0,
+        "confirm_candles": 1,
         "trailing_stop": true,
-        "slippage": 0.05
+        "slippage": 0.05,
+        "max_atr_percentile": 70.0,
+        "atr_lookback_window": 200,
+        "blocked_utc_hours": [],
+        "ma_period": 0
     }
 }

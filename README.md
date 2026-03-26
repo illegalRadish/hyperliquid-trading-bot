@@ -267,6 +267,29 @@ This trading bot is for educational and research purposes. Algorithmic trading i
 - Understand the risks involved
 - Never risk more than you can afford to lose
 
+## 🚀 AWS EC2 Deployment
+
+For production deployment on AWS EC2, see the [deployment guide](deploy/README.md).
+
+### Quick EC2 Setup
+```bash
+# 1. Launch Ubuntu 22.04 EC2 instance
+# 2. SSH into instance
+ssh -i your-key.pem ubuntu@your-ec2-ip
+
+# 3. Clone and setup
+git clone https://github.com/your-username/hyperliquid-trading-bot.git
+cd hyperliquid-trading-bot
+./deploy/setup.sh
+
+# 4. Configure credentials
+nano config.json
+
+# 5. Test and start
+./deploy/test.sh
+./deploy/start.sh
+```
+
 ## 📄 License
 
 MIT License - see LICENSE file for details.

@@ -33,8 +33,13 @@ class StrategyConfig:
     atr_stop_multiplier: float = 2.0
     tp_range_multiplier: float = 1.5      # take-profit = range_size * this
     min_range_atr_ratio: float = 2.0      # skip flat ranges
+    confirm_candles: int = 1              # candles that must close past breakout level
     trailing_stop: bool = True
     slippage: float = 0.05
+    max_atr_percentile: float = 70.0      # skip entries when ATR above this percentile of recent history
+    atr_lookback_window: int = 200        # candles used to compute ATR distribution
+    blocked_utc_hours: list = field(default_factory=list)  # e.g. [14,15,16,17,18,19,20] to skip US session
+    ma_period: int = 0                    # 0 = disabled; >0 = only trade with-trend (price vs MA)
 
     @classmethod
     def from_file(cls, path: str = "config.json") -> "StrategyConfig":
@@ -129,7 +134,9 @@ class MomentumBreakout:
     # ---- data ----
 
     def fetch_candles(self) -> list[Candle]:
-        needed = self.cfg.lookback_periods + self.cfg.atr_period + 5
+        base_need = self.cfg.lookback_periods + self.cfg.atr_period + 5
+        needed = max(base_need, self.cfg.ma_period + self.cfg.confirm_candles + 1,
+                     self.cfg.atr_lookback_window + self.cfg.confirm_candles + 1)
         interval_s = TIMEFRAME_SECONDS[self.cfg.timeframe]
         now_ms = int(time.time() * 1000)
         start_ms = now_ms - needed * interval_s * 1000
@@ -215,29 +222,71 @@ class MomentumBreakout:
 
     def evaluate(self, candles: list[Candle]) -> Optional[str]:
         """Return 'LONG', 'SHORT', or None."""
-        if len(candles) < self.cfg.lookback_periods + 2:
+        n_confirm = self.cfg.confirm_candles
+        if len(candles) < self.cfg.lookback_periods + 1 + n_confirm:
             return None
 
-        lookback = candles[-(self.cfg.lookback_periods + 1):-1]
-        current = candles[-1]
+        # --- session filter ---
+        if self.cfg.blocked_utc_hours:
+            import datetime
+            last_ts = candles[-1].timestamp / 1000
+            utc_hour = datetime.datetime.utcfromtimestamp(last_ts).hour
+            if utc_hour in self.cfg.blocked_utc_hours:
+                return None
 
+        lookback = candles[-(self.cfg.lookback_periods + n_confirm):-n_confirm]
         highest_high = max(c.high for c in lookback)
         lowest_low = min(c.low for c in lookback)
         range_size = highest_high - lowest_low
 
         avg_volume = sum(c.volume for c in lookback) / len(lookback)
-        atr = compute_atr(candles[:-1], self.cfg.atr_period)
+        atr = compute_atr(candles[:-(n_confirm)], self.cfg.atr_period)
 
         if atr == 0 or range_size < atr * self.cfg.min_range_atr_ratio:
             return None
 
-        volume_confirmed = current.volume > avg_volume * self.cfg.volume_multiplier
+        # --- ATR regime filter: skip when volatility is already elevated ---
+        if self.cfg.max_atr_percentile < 100.0:
+            window_len = min(self.cfg.atr_lookback_window, len(candles) - n_confirm - 1)
+            if window_len > self.cfg.atr_period:
+                historical_atrs = []
+                for j in range(self.cfg.atr_period + 1, window_len + 1):
+                    slice_end = len(candles) - n_confirm - (window_len - j)
+                    slice_start = max(0, slice_end - self.cfg.atr_period - 1)
+                    a = compute_atr(candles[slice_start:slice_end], self.cfg.atr_period)
+                    if a > 0:
+                        historical_atrs.append(a)
+                if historical_atrs:
+                    historical_atrs.sort()
+                    idx = int(len(historical_atrs) * self.cfg.max_atr_percentile / 100)
+                    idx = min(idx, len(historical_atrs) - 1)
+                    if atr > historical_atrs[idx]:
+                        return None
 
-        if current.close > highest_high and volume_confirmed:
-            return "LONG"
-        if current.close < lowest_low and volume_confirmed:
-            return "SHORT"
-        return None
+        confirm_slice = candles[-n_confirm:]
+        total_confirm_volume = sum(c.volume for c in confirm_slice)
+        avg_confirm_volume = total_confirm_volume / n_confirm
+
+        volume_confirmed = avg_confirm_volume > avg_volume * self.cfg.volume_multiplier
+
+        signal = None
+        if all(c.close > highest_high for c in confirm_slice) and volume_confirmed:
+            signal = "LONG"
+        elif all(c.close < lowest_low for c in confirm_slice) and volume_confirmed:
+            signal = "SHORT"
+
+        if signal is None:
+            return None
+
+        # --- trend filter (MA) ---
+        if self.cfg.ma_period > 0 and len(candles) >= self.cfg.ma_period:
+            ma = sum(c.close for c in candles[-self.cfg.ma_period:]) / self.cfg.ma_period
+            if signal == "LONG" and candles[-1].close < ma:
+                return None
+            if signal == "SHORT" and candles[-1].close > ma:
+                return None
+
+        return signal
 
     def enter(self, signal: str, candles: list[Candle]) -> None:
         current = candles[-1]
